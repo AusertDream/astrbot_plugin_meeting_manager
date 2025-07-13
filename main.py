@@ -16,13 +16,13 @@ class meeting_manager(Star):
         print("有关数据操作的指令组抬头。")
         pass
 
-    @data.command_group("members")
+    @data.command("members")
     def members():
         """和成员有关的指令组。"""
         print("有关成员操作的指令组抬头。")
         pass
 
-    @data.command_group("reading_group")
+    @data.command("reading_group")
     def reading_group():
         """管理reading group有关的指令"""
         print("有关reading group操作的指令组抬头。")
