@@ -2,14 +2,32 @@ from astrbot.api.event import filter, AstrMessageEvent, MessageEventResult
 from astrbot.api.star import Context, Star, register
 from astrbot.api import logger
 
-@register("helloworld", "YourName", "一个简单的 Hello World 插件", "1.0.0")
-class MyPlugin(Star):
+@register("meeting_manager", "Ausert", "课题组组会管理工具", "0.0.1")
+class meeting_manager(Star):
     def __init__(self, context: Context):
         super().__init__(context)
 
     async def initialize(self):
         """可选择实现异步的插件初始化方法，当实例化该插件类之后会自动调用该方法。"""
-    
+
+    @filter.command_group("data")
+    def data():
+        """和数据有关的指令组。仅/data 会输出相关help内容"""
+        print("有关数据操作的指令组抬头。")
+        pass
+
+    @data.command_group("members")
+    def members():
+        """和成员有关的指令组。"""
+        print("有关成员操作的指令组抬头。")
+        pass
+
+    @data.command_group("reading_group")
+    def reading_group():
+        """管理reading group有关的指令"""
+        print("有关reading group操作的指令组抬头。")
+        pass
+
     # 注册指令的装饰器。指令名为 helloworld。注册成功后，发送 `/helloworld` 就会触发这个指令，并回复 `你好, {user_name}!`
     @filter.command("helloworld")
     async def helloworld(self, event: AstrMessageEvent):
