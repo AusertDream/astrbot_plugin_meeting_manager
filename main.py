@@ -284,7 +284,7 @@ config = {{
             self._add_reminder_to_config(name, new_reminder)
 
             # 调度新提醒
-            self._schedule_reminder(name, new_reminder)
+            await self._schedule_reminder(name, new_reminder)
 
             yield event.plain_result(f"提醒 '{name}' 添加成功！")
 
@@ -423,16 +423,17 @@ config = {{
         """启动所有提醒任务"""
         for reminder_name, reminder_config in self.attention_config.items():
             try:
-                self._schedule_reminder(reminder_name, reminder_config)
+                await self._schedule_reminder(reminder_name, reminder_config)
                 logger.info(f"已启动提醒: {reminder_name}")
             except Exception as e:
                 logger.error(f"启动提醒 {reminder_name} 失败: {e}")
 
-    def _schedule_reminder(
+    async def _schedule_reminder(
         self,
         reminder_name: str,
         reminder_config: Dict[str, Any],
         next_time: datetime.datetime = None,
+        is_initial: bool = True,
     ):
         """调度单个提醒"""
         try:
@@ -446,21 +447,47 @@ config = {{
 
             now = datetime.datetime.now()
 
-            # 如果没有提供next_time，则计算下次提醒时间
-            if next_time is None:
-                next_time = self.calculate_next_reminder_time(
-                    base_time, repeat_interval
-                )
+            # 如果不是初始调度，需要处理执行逻辑
+            if not is_initial:
+                # 发送提醒
+                await self.send_reminder(reminder_name, reminder_config)
 
-            # 判断是否已经超过最大提醒次数
+                # 更新已发送次数（仅用于记录，不用于控制逻辑）
+                current_info = self._get_reminder_info(reminder_name)
+                times_sent = current_info.get("times_sent", 0) + 1
+                self._set_reminder_info(reminder_name, times_sent=times_sent)
+
+                # 计算下次提醒时间
+                current_time = current_info.get("next_time")
+                if current_time:
+                    next_time = current_time + repeat_interval
+                else:
+                    # 如果获取不到当前时间，重新计算
+                    next_time = self.calculate_next_reminder_time(
+                        base_time, repeat_interval
+                    )
+
+            # 基于时间的过期检查
             if repeat_times > 0 and repeat_interval.total_seconds() > 0:
+                # 有重复间隔的情况：检查是否超过最后一次提醒时间
                 max_time = base_time + repeat_interval * (repeat_times - 1)
                 if next_time > max_time:
                     logger.info(f"提醒 {reminder_name} 所有提醒已过期，不再发送")
+                    # 清理定时器和信息
+                    if reminder_name in self.reminder_timers:
+                        self.reminder_timers[reminder_name].cancel()
+                        del self.reminder_timers[reminder_name]
+                    self._remove_reminder_info(reminder_name)
                     return
             elif repeat_times > 0 and repeat_interval.total_seconds() == 0:
+                # 只提醒一次的情况：检查基础时间是否已过
                 if now > base_time:
                     logger.info(f"提醒 {reminder_name} 已过期，不再发送")
+                    # 清理定时器和信息
+                    if reminder_name in self.reminder_timers:
+                        self.reminder_timers[reminder_name].cancel()
+                        del self.reminder_timers[reminder_name]
+                    self._remove_reminder_info(reminder_name)
                     return
 
             # 计算延迟时间（秒）
@@ -473,64 +500,22 @@ config = {{
             timer = loop.call_later(
                 delay,
                 lambda: asyncio.create_task(
-                    self._execute_reminder(reminder_name, reminder_config)
+                    self._schedule_reminder(
+                        reminder_name, reminder_config, is_initial=False
+                    )
                 ),
             )
 
             self.reminder_timers[reminder_name] = timer
             self._set_reminder_info(reminder_name, next_time=next_time)
-            logger.info(f"提醒 {reminder_name} 将在 {next_time} 发送")
+
+            if is_initial:
+                logger.info(f"提醒 {reminder_name} 将在 {next_time} 发送")
+            else:
+                logger.info(f"提醒 {reminder_name} 下次将在 {next_time} 发送")
 
         except Exception as e:
             logger.error(f"调度提醒 {reminder_name} 失败: {e}")
-
-    async def _execute_reminder(
-        self, reminder_name: str, reminder_config: Dict[str, Any]
-    ):
-        """执行单个提醒"""
-        try:
-            # 发送提醒
-            await self.send_reminder(reminder_name, reminder_config)
-
-            # 计算下次提醒时间
-            repeat_str = reminder_config.get("repeat", "1:00:00:00")
-            repeat_times = reminder_config.get("repeat_times", 0)
-            repeat_interval = self.parse_repeat_interval(repeat_str)
-
-            # 更新已发送次数
-            current_info = self._get_reminder_info(reminder_name)
-            times_sent = current_info.get("times_sent", 0) + 1
-            self._set_reminder_info(reminder_name, times_sent=times_sent)
-
-            # 检查是否达到重复次数限制
-            if repeat_times > 0 and times_sent >= repeat_times:
-                logger.info(f"提醒 {reminder_name} 已达到重复次数限制，停止发送")
-                if reminder_name in self.reminder_timers:
-                    self.reminder_timers[reminder_name].cancel()
-                    del self.reminder_timers[reminder_name]
-                self._remove_reminder_info(reminder_name)
-                return
-
-            # 计算下次提醒时间
-            current_time = current_info.get("next_time")
-            if current_time:
-                next_time = current_time + repeat_interval
-            else:
-                # 如果获取不到当前时间，重新计算
-                base_time_str = reminder_config.get("time")
-                base_time = datetime.datetime.strptime(
-                    base_time_str, "%Y-%m-%d %H:%M:%S"
-                )
-                next_time = self.calculate_next_reminder_time(
-                    base_time, repeat_interval
-                )
-
-            # 更新提醒信息并重新调度
-            self._schedule_reminder(reminder_name, reminder_config, next_time)
-            logger.info(f"提醒 {reminder_name} 下次将在 {next_time} 发送")
-
-        except Exception as e:
-            logger.error(f"执行提醒 {reminder_name} 失败: {e}")
 
     async def stop_all_reminders(self):
         """停止所有提醒任务"""
