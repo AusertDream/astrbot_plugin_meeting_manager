@@ -1,0 +1,10 @@
+[project]
+name = "astrbot-plugin-meeting-manager"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = [
+    "astrbot>=3.5.22",
+    "PyYAML>=6.0",
+]
