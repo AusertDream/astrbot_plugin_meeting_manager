@@ -3,6 +3,7 @@ import random
 import yaml
 import datetime
 import json
+import shlex
 from typing import Dict, List, Any
 from astrbot.api.event import filter, AstrMessageEvent
 from astrbot.api.star import Context, Star, register
@@ -18,6 +19,11 @@ class meeting_manager(Star):
         self.next_reminder_times: Dict[str, datetime.datetime] = {}
         self.config_file = "config.yml"
         self.dynamic_config_file = "dynamic_config.yml"
+
+    @property
+    def attention_config(self) -> Dict[str, Any]:
+        """获取attention配置"""
+        return self.config_data.get("attention", {})
 
     async def initialize(self):
         """插件初始化时加载配置并启动定时任务"""
@@ -39,22 +45,6 @@ class meeting_manager(Star):
             logger.error(f"配置文件加载失败: {e}")
             self.config_data = {}
 
-    async def load_dynamic_config(self):
-        """加载动态配置文件"""
-        try:
-            with open(self.dynamic_config_file, "r", encoding="utf-8") as f:
-                dynamic_config = yaml.safe_load(f)
-                if dynamic_config and "attention" in dynamic_config:
-                    # 合并动态配置到主配置
-                    if "attention" not in self.config_data:
-                        self.config_data["attention"] = {}
-                    self.config_data["attention"].update(dynamic_config["attention"])
-            logger.info("动态配置文件加载成功")
-        except FileNotFoundError:
-            logger.info("动态配置文件不存在，将创建新文件")
-        except Exception as e:
-            logger.error(f"动态配置文件加载失败: {e}")
-
     def _load_dynamic_config_data(self) -> Dict[str, Any]:
         """读取动态配置文件数据"""
         try:
@@ -67,6 +57,21 @@ class meeting_manager(Star):
             logger.error(f"读取动态配置失败: {e}")
             return {"attention": {}}
 
+    async def load_dynamic_config(self):
+        """加载动态配置文件"""
+        try:
+            dynamic_config = self._load_dynamic_config_data()
+            if dynamic_config and "attention" in dynamic_config:
+                # 合并动态配置到主配置
+                if "attention" not in self.config_data:
+                    self.config_data["attention"] = {}
+                self.config_data["attention"].update(dynamic_config["attention"])
+            logger.info("动态配置文件加载成功")
+        except FileNotFoundError:
+            logger.info("动态配置文件不存在，将创建新文件")
+        except Exception as e:
+            logger.error(f"动态配置文件加载失败: {e}")
+
     def _save_dynamic_config_data(self, dynamic_config: Dict[str, Any]):
         """保存动态配置数据到文件"""
         try:
@@ -77,6 +82,7 @@ class meeting_manager(Star):
             logger.info("动态配置保存成功")
         except Exception as e:
             logger.error(f"保存动态配置失败: {e}")
+            raise
 
     def _validate_time_format(self, time_str: str) -> bool:
         """验证时间格式"""
@@ -135,17 +141,15 @@ class meeting_manager(Star):
         return True, "参数验证通过"
 
     def _parse_command_parts(self, message_str: str, expected_parts: int) -> List[str]:
-        """解析命令参数"""
-        parts = message_str.split(maxsplit=expected_parts - 1)
-        return parts if len(parts) >= expected_parts else []
-
-    def _clean_message_quotes(self, message: str) -> str:
-        """清理消息中的引号"""
-        if message.startswith('"') and message.endswith('"'):
-            return message[1:-1]
-        elif message.startswith("'") and message.endswith("'"):
-            return message[1:-1]
-        return message
+        """解析命令参数，支持带引号的参数"""
+        try:
+            # 使用 shlex 来正确处理带引号的参数
+            parts = shlex.split(message_str)
+            return parts if len(parts) >= expected_parts else []
+        except ValueError:
+            # 如果 shlex 解析失败，回退到原来的方法
+            parts = message_str.split(maxsplit=expected_parts - 1)
+            return parts if len(parts) >= expected_parts else []
 
     @filter.command("reminder_add")
     async def reminder_add(self, event: AstrMessageEvent):
@@ -167,16 +171,38 @@ class meeting_manager(Star):
             time_str = parts[3]
             repeat_str = parts[4]
             repeat_times_str = parts[5]
-            message = self._clean_message_quotes(parts[6])
+            message = parts[6]
 
             # 解析sid列表
             try:
+                # 尝试JSON格式解析
                 sid = json.loads(sid_str)
                 if not isinstance(sid, list):
                     raise ValueError("sid必须是列表")
-            except Exception as e:
-                yield event.plain_result(f"sid格式错误: {e}")
-                return
+            except (json.JSONDecodeError, ValueError):
+                # 尝试Python列表格式解析
+                try:
+                    # 移除可能的方括号，按逗号分割
+                    clean_sid_str = sid_str.strip()
+                    if clean_sid_str.startswith("[") and clean_sid_str.endswith("]"):
+                        clean_sid_str = clean_sid_str[1:-1]
+
+                    # 按逗号分割并清理引号
+                    sid_items = []
+                    for item in clean_sid_str.split(","):
+                        item = item.strip().strip("'\"")
+                        if item:
+                            sid_items.append(item)
+
+                    if not sid_items:
+                        raise ValueError("sid列表不能为空")
+
+                    sid = sid_items
+                except Exception as e:
+                    yield event.plain_result(
+                        f'sid格式错误: {e}。支持格式: [123,456] 或 ["user1","user2"]'
+                    )
+                    return
 
             # 解析重复次数
             try:
@@ -195,7 +221,7 @@ class meeting_manager(Star):
                 return
 
             # 检查名称是否已存在
-            if name in self.config_data.get("attention", {}):
+            if name in self.attention_config:
                 yield event.plain_result(f"提醒名称 '{name}' 已存在，请使用其他名称")
                 return
 
@@ -244,7 +270,7 @@ class meeting_manager(Star):
             name = parts[1]
 
             # 检查提醒是否存在
-            if name not in self.config_data.get("attention", {}):
+            if name not in self.attention_config:
                 yield event.plain_result(f"提醒 '{name}' 不存在")
                 return
 
@@ -284,14 +310,12 @@ class meeting_manager(Star):
     async def reminder_list(self, event: AstrMessageEvent):
         """列出所有提醒任务"""
         try:
-            attention_config = self.config_data.get("attention", {})
-
-            if not attention_config:
+            if not self.attention_config:
                 yield event.plain_result("当前没有配置任何提醒")
                 return
 
             list_msg = "当前所有提醒任务:\n"
-            for name, config in attention_config.items():
+            for name, config in self.attention_config.items():
                 status = "运行中" if name in self.reminder_tasks else "已停止"
                 next_time = self.next_reminder_times.get(name, "未知")
                 if isinstance(next_time, datetime.datetime):
@@ -340,7 +364,7 @@ class meeting_manager(Star):
 
         # 随机调整1~40秒
         random_adjustment = random.randint(1, 40)
-        next_time = next_time - datetime.timedelta(seconds=random_adjustment)
+        next_time = next_time + datetime.timedelta(seconds=random_adjustment)
 
         return next_time
 
@@ -434,9 +458,7 @@ class meeting_manager(Star):
 
     async def start_all_reminders(self):
         """启动所有提醒任务"""
-        attention_config = self.config_data.get("attention", {})
-
-        for reminder_name, reminder_config in attention_config.items():
+        for reminder_name, reminder_config in self.attention_config.items():
             try:
                 task = asyncio.create_task(
                     self.reminder_loop(reminder_name, reminder_config)
@@ -498,33 +520,6 @@ class meeting_manager(Star):
         except Exception as e:
             logger.error(f"重新加载配置失败: {e}")
             yield event.plain_result(f"重新加载配置失败: {e}")
-
-    @filter.command_group("data")
-    def data():
-        """和数据有关的指令组。仅/data 会输出相关help内容"""
-        print("有关数据操作的指令组抬头。")
-        pass
-
-    @data.command("members")
-    def members():
-        """和成员有关的指令组。"""
-        print("有关成员操作的指令组抬头。")
-        pass
-
-    @data.command("reading_group")
-    def reading_group():
-        """管理reading group有关的指令"""
-        print("有关reading group操作的指令组抬头。")
-        pass
-
-    @filter.command("helloworld")
-    async def helloworld(self, event: AstrMessageEvent):
-        """这是一个 hello world 指令"""
-        user_name = event.get_sender_name()
-        message_str = event.message_str
-        message_chain = event.get_messages()
-        logger.info(message_chain)
-        yield event.plain_result(f"Hello, {user_name}, 你发了 {message_str}!")
 
     async def terminate(self):
         """插件销毁时停止所有定时任务"""
