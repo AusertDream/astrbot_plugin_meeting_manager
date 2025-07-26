@@ -1,24 +1,29 @@
 import asyncio
+import random
 import yaml
 import datetime
-from typing import Dict, Any
+import json
+from typing import Dict, List, Any
 from astrbot.api.event import filter, AstrMessageEvent
 from astrbot.api.star import Context, Star, register
 from astrbot.api import logger
 
 
-@register("meeting_manager", "Ausert", "课题组组会管理工具", "0.0.1")
+@register("meeting_manager", "Ausert", "课题组组会管理工具", "0.0.2")
 class meeting_manager(Star):
     def __init__(self, context: Context):
         super().__init__(context)
         self.reminder_tasks: Dict[str, asyncio.Task] = {}
         self.config_data: Dict[str, Any] = {}
         self.next_reminder_times: Dict[str, datetime.datetime] = {}
+        self.config_file = "config.yml"
+        self.dynamic_config_file = "dynamic_config.yml"
 
     async def initialize(self):
         """插件初始化时加载配置并启动定时任务"""
         try:
             await self.load_config()
+            await self.load_dynamic_config()
             await self.start_all_reminders()
             logger.info("定时提醒插件初始化完成")
         except Exception as e:
@@ -27,25 +32,295 @@ class meeting_manager(Star):
     async def load_config(self):
         """加载配置文件"""
         try:
-            with open("config.yml", "r", encoding="utf-8") as f:
+            with open(self.config_file, "r", encoding="utf-8") as f:
                 self.config_data = yaml.safe_load(f)
             logger.info("配置文件加载成功")
         except Exception as e:
             logger.error(f"配置文件加载失败: {e}")
             self.config_data = {}
 
-    def parse_repeat_interval(self, repeat_str: str) -> datetime.timedelta:
-        """解析重复时间间隔字符串，格式：天:时:分:秒"""
+    async def load_dynamic_config(self):
+        """加载动态配置文件"""
+        try:
+            with open(self.dynamic_config_file, "r", encoding="utf-8") as f:
+                dynamic_config = yaml.safe_load(f)
+                if dynamic_config and "attention" in dynamic_config:
+                    # 合并动态配置到主配置
+                    if "attention" not in self.config_data:
+                        self.config_data["attention"] = {}
+                    self.config_data["attention"].update(dynamic_config["attention"])
+            logger.info("动态配置文件加载成功")
+        except FileNotFoundError:
+            logger.info("动态配置文件不存在，将创建新文件")
+        except Exception as e:
+            logger.error(f"动态配置文件加载失败: {e}")
+
+    def _load_dynamic_config_data(self) -> Dict[str, Any]:
+        """读取动态配置文件数据"""
+        try:
+            with open(self.dynamic_config_file, "r", encoding="utf-8") as f:
+                dynamic_config = yaml.safe_load(f)
+                return dynamic_config if dynamic_config else {"attention": {}}
+        except FileNotFoundError:
+            return {"attention": {}}
+        except Exception as e:
+            logger.error(f"读取动态配置失败: {e}")
+            return {"attention": {}}
+
+    def _save_dynamic_config_data(self, dynamic_config: Dict[str, Any]):
+        """保存动态配置数据到文件"""
+        try:
+            with open(self.dynamic_config_file, "w", encoding="utf-8") as f:
+                yaml.dump(
+                    dynamic_config, f, default_flow_style=False, allow_unicode=True
+                )
+            logger.info("动态配置保存成功")
+        except Exception as e:
+            logger.error(f"保存动态配置失败: {e}")
+
+    def _validate_time_format(self, time_str: str) -> bool:
+        """验证时间格式"""
+        try:
+            datetime.datetime.strptime(time_str, "%Y-%m-%d %H:%M:%S")
+            return True
+        except ValueError:
+            return False
+
+    def _validate_repeat_format(self, repeat_str: str) -> bool:
+        """验证重复间隔格式"""
         try:
             parts = repeat_str.split(":")
-            if len(parts) == 4:
-                days, hours, minutes, seconds = map(int, parts)
-                return datetime.timedelta(
-                    days=days, hours=hours, minutes=minutes, seconds=seconds
+            if len(parts) != 4:
+                return False
+            for part in parts:
+                int(part)
+            return True
+        except ValueError:
+            return False
+
+    def validate_reminder_params(
+        self,
+        name: str,
+        sid: List[str],
+        time_str: str,
+        repeat_str: str,
+        repeat_times: int,
+        message: str,
+    ) -> tuple[bool, str]:
+        """验证提醒参数"""
+        # 检查名称
+        if not name or not name.strip():
+            return False, "提醒名称不能为空"
+
+        # 检查sid
+        if not sid or not isinstance(sid, list):
+            return False, "sid必须是非空列表"
+
+        # 检查时间格式
+        if not self._validate_time_format(time_str):
+            return False, f"时间格式错误: {time_str}，正确格式: YYYY-MM-DD HH:MM:SS"
+
+        # 检查重复间隔格式
+        if not self._validate_repeat_format(repeat_str):
+            return False, f"重复间隔格式错误: {repeat_str}，正确格式: 天:时:分:秒"
+
+        # 检查重复次数
+        if not isinstance(repeat_times, int) or repeat_times < -1:
+            return False, "重复次数必须是大于等于-1的整数"
+
+        # 检查消息
+        if not message or not message.strip():
+            return False, "提醒消息不能为空"
+
+        return True, "参数验证通过"
+
+    def _parse_command_parts(self, message_str: str, expected_parts: int) -> List[str]:
+        """解析命令参数"""
+        parts = message_str.split(maxsplit=expected_parts - 1)
+        return parts if len(parts) >= expected_parts else []
+
+    def _clean_message_quotes(self, message: str) -> str:
+        """清理消息中的引号"""
+        if message.startswith('"') and message.endswith('"'):
+            return message[1:-1]
+        elif message.startswith("'") and message.endswith("'"):
+            return message[1:-1]
+        return message
+
+    @filter.command("reminder_add")
+    async def reminder_add(self, event: AstrMessageEvent):
+        """添加新的提醒任务
+        用法: /reminder_add <名称> <sid列表> <时间> <重复间隔> <重复次数> <消息>
+        示例: /reminder_add test1 [123,456] "2025-01-20 19:30:00" "7:00:00:00" 10 "测试提醒"
+        """
+        try:
+            parts = self._parse_command_parts(event.message_str.strip(), 7)
+            if len(parts) < 7:
+                yield event.plain_result(
+                    "参数不足！用法: /reminder_add <名称> <sid列表> <时间> <重复间隔> <重复次数> <消息>\n"
+                    '示例: /reminder_add test1 [123,456] "2025-01-20 19:30:00" "7:00:00:00" 10 "测试提醒"'
                 )
-            else:
-                logger.warning(f"无效的重复时间格式: {repeat_str}")
-                return datetime.timedelta(days=1)
+                return
+
+            name = parts[1]
+            sid_str = parts[2]
+            time_str = parts[3]
+            repeat_str = parts[4]
+            repeat_times_str = parts[5]
+            message = self._clean_message_quotes(parts[6])
+
+            # 解析sid列表
+            try:
+                sid = json.loads(sid_str)
+                if not isinstance(sid, list):
+                    raise ValueError("sid必须是列表")
+            except Exception as e:
+                yield event.plain_result(f"sid格式错误: {e}")
+                return
+
+            # 解析重复次数
+            try:
+                repeat_times = int(repeat_times_str)
+            except ValueError:
+                yield event.plain_result("重复次数必须是整数")
+                return
+
+            # 验证参数
+            is_valid, error_msg = self.validate_reminder_params(
+                name, sid, time_str, repeat_str, repeat_times, message
+            )
+
+            if not is_valid:
+                yield event.plain_result(f"参数验证失败: {error_msg}")
+                return
+
+            # 检查名称是否已存在
+            if name in self.config_data.get("attention", {}):
+                yield event.plain_result(f"提醒名称 '{name}' 已存在，请使用其他名称")
+                return
+
+            # 创建新提醒配置
+            new_reminder = {
+                "sid": sid,
+                "time": time_str,
+                "repeat": repeat_str,
+                "repeat_times": repeat_times,
+                "message": message,
+            }
+
+            # 添加到配置
+            if "attention" not in self.config_data:
+                self.config_data["attention"] = {}
+            self.config_data["attention"][name] = new_reminder
+
+            # 保存到动态配置文件
+            dynamic_config = self._load_dynamic_config_data()
+            dynamic_config["attention"][name] = new_reminder
+            self._save_dynamic_config_data(dynamic_config)
+            logger.info(f"动态配置已保存，新增提醒: {name}")
+
+            # 启动新提醒任务
+            task = asyncio.create_task(self.reminder_loop(name, new_reminder))
+            self.reminder_tasks[name] = task
+
+            yield event.plain_result(f"提醒 '{name}' 添加成功！")
+
+        except Exception as e:
+            logger.error(f"添加提醒失败: {e}")
+            yield event.plain_result(f"添加提醒失败: {e}")
+
+    @filter.command("reminder_del")
+    async def reminder_del(self, event: AstrMessageEvent):
+        """删除提醒任务
+        用法: /reminder_del <名称>
+        示例: /reminder_del test1
+        """
+        try:
+            parts = self._parse_command_parts(event.message_str.strip(), 2)
+            if len(parts) < 2:
+                yield event.plain_result("用法: /reminder_del <名称>")
+                return
+
+            name = parts[1]
+
+            # 检查提醒是否存在
+            if name not in self.config_data.get("attention", {}):
+                yield event.plain_result(f"提醒 '{name}' 不存在")
+                return
+
+            # 停止任务
+            if name in self.reminder_tasks:
+                try:
+                    self.reminder_tasks[name].cancel()
+                    await self.reminder_tasks[name]
+                except asyncio.CancelledError:
+                    pass
+                except Exception as e:
+                    logger.error(f"停止提醒任务 {name} 失败: {e}")
+
+                del self.reminder_tasks[name]
+
+            # 从配置中删除
+            del self.config_data["attention"][name]
+
+            # 从下次提醒时间中删除
+            if name in self.next_reminder_times:
+                del self.next_reminder_times[name]
+
+            # 更新动态配置文件
+            dynamic_config = self._load_dynamic_config_data()
+            if name in dynamic_config["attention"]:
+                del dynamic_config["attention"][name]
+            self._save_dynamic_config_data(dynamic_config)
+            logger.info(f"动态配置已更新，删除提醒: {name}")
+
+            yield event.plain_result(f"提醒 '{name}' 删除成功！")
+
+        except Exception as e:
+            logger.error(f"删除提醒失败: {e}")
+            yield event.plain_result(f"删除提醒失败: {e}")
+
+    @filter.command("reminder_list")
+    async def reminder_list(self, event: AstrMessageEvent):
+        """列出所有提醒任务"""
+        try:
+            attention_config = self.config_data.get("attention", {})
+
+            if not attention_config:
+                yield event.plain_result("当前没有配置任何提醒")
+                return
+
+            list_msg = "当前所有提醒任务:\n"
+            for name, config in attention_config.items():
+                status = "运行中" if name in self.reminder_tasks else "已停止"
+                next_time = self.next_reminder_times.get(name, "未知")
+                if isinstance(next_time, datetime.datetime):
+                    next_time = next_time.strftime("%Y-%m-%d %H:%M:%S")
+
+                list_msg += f"\n📅 {name} ({status})\n"
+                list_msg += f"   消息: {config.get('message', 'N/A')}\n"
+                list_msg += f"   下次提醒: {next_time}\n"
+                list_msg += f"   重复: {config.get('repeat', 'N/A')}\n"
+                list_msg += f"   剩余次数: {config.get('repeat_times', 'N/A')}\n"
+
+            yield event.plain_result(list_msg)
+
+        except Exception as e:
+            logger.error(f"列出提醒失败: {e}")
+            yield event.plain_result(f"列出提醒失败: {e}")
+
+    def parse_repeat_interval(self, repeat_str: str) -> datetime.timedelta:
+        """解析重复时间间隔字符串，格式：天:时:分:秒"""
+        if not self._validate_repeat_format(repeat_str):
+            logger.warning(f"无效的重复时间格式: {repeat_str}")
+            return datetime.timedelta(days=1)
+
+        try:
+            parts = repeat_str.split(":")
+            days, hours, minutes, seconds = map(int, parts)
+            return datetime.timedelta(
+                days=days, hours=hours, minutes=minutes, seconds=seconds
+            )
         except Exception as e:
             logger.error(f"解析重复时间失败: {e}")
             return datetime.timedelta(days=1)
@@ -62,6 +337,10 @@ class meeting_manager(Star):
             next_time = base_time + (repeat_interval * intervals_passed)
         else:
             next_time = base_time
+
+        # 随机调整1~40秒
+        random_adjustment = random.randint(1, 40)
+        next_time = next_time + datetime.timedelta(seconds=random_adjustment)
 
         return next_time
 
@@ -93,7 +372,7 @@ class meeting_manager(Star):
         try:
             base_time_str = reminder_config.get("time")
             repeat_str = reminder_config.get("repeat", "1:00:00:00")
-            repeat_times = reminder_config.get("repeat_times", -1)
+            repeat_times = reminder_config.get("repeat_times", 0)
 
             # 解析时间
             base_time = datetime.datetime.strptime(base_time_str, "%Y-%m-%d %H:%M:%S")
@@ -163,24 +442,6 @@ class meeting_manager(Star):
         self.reminder_tasks.clear()
         self.next_reminder_times.clear()
 
-    @filter.command("reminder_test")
-    async def reminder_test(self, event: AstrMessageEvent):
-        """测试提醒功能"""
-        try:
-            attention_config = self.config_data.get("attention", {})
-            if not attention_config:
-                yield event.plain_result("当前没有配置任何提醒")
-                return
-
-            # 发送测试消息
-            for reminder_name, reminder_config in attention_config.items():
-                message = reminder_config.get("message", "测试提醒")
-                yield event.plain_result(f"测试提醒 '{reminder_name}': {message}")
-
-        except Exception as e:
-            logger.error(f"测试提醒失败: {e}")
-            yield event.plain_result(f"测试提醒失败: {e}")
-
     @filter.command("reminder_status")
     async def reminder_status(self, event: AstrMessageEvent):
         """查看提醒状态"""
@@ -208,6 +469,7 @@ class meeting_manager(Star):
 
             # 重新加载配置
             await self.load_config()
+            await self.load_dynamic_config()  # 重新加载动态配置
 
             # 启动新任务
             await self.start_all_reminders()

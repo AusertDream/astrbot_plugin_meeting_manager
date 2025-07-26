@@ -21,14 +21,28 @@
 
 ### 定时提醒相关命令
 
-#### `/reminder_test`
-测试所有配置的提醒功能，立即发送提醒消息到当前聊天
-
 #### `/reminder_status`
 查看所有提醒任务的当前状态，显示下次提醒时间
 
 #### `/reminder_reload`
 重新加载配置文件，适用于修改配置后无需重启插件
+
+#### `/reminder_add`
+添加新的提醒任务
+```
+用法: /reminder_add <名称> <sid列表> <时间> <重复间隔> <重复次数> <消息>
+示例: /reminder_add test1 [123,456] "2025-01-20 19:30:00" "7:00:00:00" 10 "测试提醒"
+```
+
+#### `/reminder_del`
+删除指定的提醒任务
+```
+用法: /reminder_del <名称>
+示例: /reminder_del test1
+```
+
+#### `/reminder_list`
+列出所有提醒任务的详细信息，包括状态、下次提醒时间等
 
 ### 其他命令
 
@@ -49,16 +63,25 @@ Reading Group管理相关操作
 attention:
   # 提醒任务名称
   任务名称:
-    id: [用户ID1, 用户ID2, ...]  # 接收提醒的用户ID列表
+    sid: [用户ID1, 用户ID2, ...]  # 接收提醒的用户/群聊ID列表
     time: YYYY-MM-DD HH:MM:SS   # 首次提醒时间
     repeat: 天:时:分:秒          # 重复间隔
     repeat_times: 次数           # 重复次数，-1表示无限重复
     message: '提醒消息内容'      # 提醒消息
 ```
 
+### 动态配置管理
+
+插件支持两种配置方式：
+
+1. **静态配置** (`config.yml`): 在配置文件中预先定义的提醒任务
+2. **动态配置** (`dynamic_config.yml`): 通过指令动态添加的提醒任务
+
+动态添加的提醒会自动保存到 `dynamic_config.yml` 文件中，重启插件后仍然有效。
+
 ### 配置参数详解
 
-- **id**: 接收提醒的用户ID列表，支持多个用户
+- **sid**: 接收提醒的用户/群聊ID列表，支持多个用户或群聊
 - **time**: 首次提醒时间，格式为 `YYYY-MM-DD HH:MM:SS`
 - **repeat**: 重复间隔，格式为 `天:时:分:秒`
   - 例如：`7:00:00:00` 表示每7天重复一次
@@ -76,25 +99,25 @@ attention:
 attention:
   # 每周组会提醒
   weekly_meeting:
-    id: [123, 456, 789]
+    sid: [123, 456, 789]
     time: 2025-01-20 19:30:00
-    repeat: 7:00:00:00
+    repeat: "7:00:00:00"
     repeat_times: 100
     message: '还有半小时就要组会啦！请做好准备。'
     
   # 每日打卡提醒
   daily_checkin:
-    id: [123, 456]
+    sid: [123, 456]
     time: 2025-01-20 09:00:00
-    repeat: 1:00:00:00
+    repeat: "1:00:00:00"
     repeat_times: -1
     message: '早上好！请记得打卡签到。'
     
   # 一次性提醒
   project_deadline:
-    id: [123]
+    sid: [123]
     time: 2025-02-01 10:00:00
-    repeat: 0:00:00:00
+    repeat: "0:00:00:00"
     repeat_times: 1
     message: '项目截止日期快到了，请抓紧时间完成！'
 ```
