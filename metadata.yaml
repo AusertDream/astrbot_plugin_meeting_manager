@@ -1,5 +1,5 @@
 name: MeetingManager # 这是你的插件的唯一识别名。
 desc: 基于AstrBot 的课题组组会管理插件，包括组会日程安排，汇报人员管理，reading group管理等功能。 # 插件简短描述
-version: v0.0.1 
-author: Ausert/Tianyi Jiang # 作者
+version: v0.0.2 
+author: Ausert # 作者
 repo: https://github.com/AusertDream/astrbot_plugin_meeting_manager # 插件的仓库地址
