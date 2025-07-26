@@ -340,7 +340,7 @@ class meeting_manager(Star):
 
         # 随机调整1~40秒
         random_adjustment = random.randint(1, 40)
-        next_time = next_time + datetime.timedelta(seconds=random_adjustment)
+        next_time = next_time - datetime.timedelta(seconds=random_adjustment)
 
         return next_time
 
@@ -378,13 +378,32 @@ class meeting_manager(Star):
             base_time = datetime.datetime.strptime(base_time_str, "%Y-%m-%d %H:%M:%S")
             repeat_interval = self.parse_repeat_interval(repeat_str)
 
+            now = datetime.datetime.now()
             # 计算下次提醒时间
             next_time = self.calculate_next_reminder_time(base_time, repeat_interval)
+
+            # 判断是否已经超过最大提醒次数
+            if repeat_times > 0 and repeat_interval.total_seconds() > 0:
+                # 计算最大允许的提醒时间点
+                max_time = base_time + repeat_interval * (repeat_times - 1)
+                if next_time > max_time:
+                    logger.info(f"提醒 {reminder_name} 所有提醒已过期，不再发送")
+                    return
+                # 计算已发送次数
+                times_sent = (
+                    next_time - base_time
+                ).total_seconds() // repeat_interval.total_seconds()
+            elif repeat_times > 0 and repeat_interval.total_seconds() == 0:
+                # 只提醒一次
+                if now > base_time:
+                    logger.info(f"提醒 {reminder_name} 已过期，不再发送")
+                    return
+                times_sent = 0
+            else:
+                times_sent = 0
+
             self.next_reminder_times[reminder_name] = next_time
-
             logger.info(f"提醒 {reminder_name} 将在 {next_time} 发送")
-
-            times_sent = 0
 
             while True:
                 now = datetime.datetime.now()
