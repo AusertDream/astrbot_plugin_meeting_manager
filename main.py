@@ -1,9 +1,9 @@
 import asyncio
 import random
-import yaml
 import datetime
 import json
 import shlex
+import importlib.util
 from typing import Dict, List, Any
 from astrbot.api.event import filter, AstrMessageEvent
 from astrbot.api.star import Context, Star, register
@@ -14,16 +14,57 @@ from astrbot.api import logger
 class meeting_manager(Star):
     def __init__(self, context: Context):
         super().__init__(context)
-        self.reminder_tasks: Dict[str, asyncio.Task] = {}
+        self.reminder_timers: Dict[str, asyncio.TimerHandle] = {}
         self.config_data: Dict[str, Any] = {}
-        self.next_reminder_times: Dict[str, datetime.datetime] = {}
-        self.config_file = "config.yml"
-        self.dynamic_config_file = "dynamic_config.yml"
+        self.reminder_info: Dict[str, Dict[str, Any]] = {}  # 合并的提醒信息
+        self.config_file = "config.py"
+        self.dynamic_config_file = "dynamic_config.py"
 
     @property
     def attention_config(self) -> Dict[str, Any]:
         """获取attention配置"""
         return self.config_data.get("attention", {})
+
+    def _get_reminder_info(self, name: str) -> Dict[str, Any]:
+        """获取提醒信息"""
+        return self.reminder_info.get(name, {})
+
+    def _set_reminder_info(self, name: str, **kwargs):
+        """设置提醒信息"""
+        if name not in self.reminder_info:
+            self.reminder_info[name] = {}
+        self.reminder_info[name].update(kwargs)
+
+    def _remove_reminder_info(self, name: str):
+        """删除提醒信息"""
+        if name in self.reminder_info:
+            del self.reminder_info[name]
+
+    def _add_reminder_to_config(self, name: str, reminder_config: Dict[str, Any]):
+        """添加提醒到配置"""
+        self.config_data["attention"][name] = reminder_config
+
+        # 保存到动态配置文件
+        dynamic_config = self._load_dynamic_config_data()
+        dynamic_config["attention"][name] = reminder_config
+        self._save_dynamic_config_data(dynamic_config)
+        logger.info(f"动态配置已保存，新增提醒: {name}")
+
+    def _remove_reminder_from_config(self, name: str):
+        """从配置中删除提醒"""
+        # 从主配置中删除
+        if name in self.config_data["attention"]:
+            del self.config_data["attention"][name]
+
+        # 从提醒信息中删除
+        self._remove_reminder_info(name)
+
+        # 更新动态配置文件
+        dynamic_config = self._load_dynamic_config_data()
+        if name in dynamic_config["attention"]:
+            del dynamic_config["attention"][name]
+        self._save_dynamic_config_data(dynamic_config)
+        logger.info(f"动态配置已更新，删除提醒: {name}")
 
     async def initialize(self):
         """插件初始化时加载配置并启动定时任务"""
@@ -38,8 +79,11 @@ class meeting_manager(Star):
     async def load_config(self):
         """加载配置文件"""
         try:
-            with open(self.config_file, "r", encoding="utf-8") as f:
-                self.config_data = yaml.safe_load(f)
+            # 动态导入Python配置文件
+            spec = importlib.util.spec_from_file_location("config", self.config_file)
+            config_module = importlib.util.module_from_spec(spec)
+            spec.loader.exec_module(config_module)
+            self.config_data = config_module.config
             logger.info("配置文件加载成功")
         except Exception as e:
             logger.error(f"配置文件加载失败: {e}")
@@ -48,9 +92,13 @@ class meeting_manager(Star):
     def _load_dynamic_config_data(self) -> Dict[str, Any]:
         """读取动态配置文件数据"""
         try:
-            with open(self.dynamic_config_file, "r", encoding="utf-8") as f:
-                dynamic_config = yaml.safe_load(f)
-                return dynamic_config if dynamic_config else {"attention": {}}
+            # 动态导入Python配置文件
+            spec = importlib.util.spec_from_file_location(
+                "dynamic_config", self.dynamic_config_file
+            )
+            dynamic_config_module = importlib.util.module_from_spec(spec)
+            spec.loader.exec_module(dynamic_config_module)
+            return dynamic_config_module.config
         except FileNotFoundError:
             return {"attention": {}}
         except Exception as e:
@@ -75,10 +123,25 @@ class meeting_manager(Star):
     def _save_dynamic_config_data(self, dynamic_config: Dict[str, Any]):
         """保存动态配置数据到文件"""
         try:
+            # 生成Python格式的配置内容
+            config_content = f'''#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""
+动态配置文件
+用于存储运行时添加的提醒配置
+此文件会在程序运行时自动更新
+"""
+
+# 动态提醒配置字典
+attention = {repr(dynamic_config.get("attention", {}))}
+
+# 动态配置字典
+config = {{
+    "attention": attention
+}}
+'''
             with open(self.dynamic_config_file, "w", encoding="utf-8") as f:
-                yaml.dump(
-                    dynamic_config, f, default_flow_style=False, allow_unicode=True
-                )
+                f.write(config_content)
             logger.info("动态配置保存成功")
         except Exception as e:
             logger.error(f"保存动态配置失败: {e}")
@@ -175,34 +238,17 @@ class meeting_manager(Star):
 
             # 解析sid列表
             try:
-                # 尝试JSON格式解析
+                # 使用JSON解析，因为shlex已经处理了引号
                 sid = json.loads(sid_str)
                 if not isinstance(sid, list):
                     raise ValueError("sid必须是列表")
-            except (json.JSONDecodeError, ValueError):
-                # 尝试Python列表格式解析
-                try:
-                    # 移除可能的方括号，按逗号分割
-                    clean_sid_str = sid_str.strip()
-                    if clean_sid_str.startswith("[") and clean_sid_str.endswith("]"):
-                        clean_sid_str = clean_sid_str[1:-1]
-
-                    # 按逗号分割并清理引号
-                    sid_items = []
-                    for item in clean_sid_str.split(","):
-                        item = item.strip().strip("'\"")
-                        if item:
-                            sid_items.append(item)
-
-                    if not sid_items:
-                        raise ValueError("sid列表不能为空")
-
-                    sid = sid_items
-                except Exception as e:
-                    yield event.plain_result(
-                        f'sid格式错误: {e}。支持格式: [123,456] 或 ["user1","user2"]'
-                    )
-                    return
+                if not sid:
+                    raise ValueError("sid列表不能为空")
+            except (json.JSONDecodeError, ValueError) as e:
+                yield event.plain_result(
+                    f'sid格式错误: {e}。支持格式: [123,456] 或 ["user1","user2"]'
+                )
+                return
 
             # 解析重复次数
             try:
@@ -235,19 +281,10 @@ class meeting_manager(Star):
             }
 
             # 添加到配置
-            if "attention" not in self.config_data:
-                self.config_data["attention"] = {}
-            self.config_data["attention"][name] = new_reminder
+            self._add_reminder_to_config(name, new_reminder)
 
-            # 保存到动态配置文件
-            dynamic_config = self._load_dynamic_config_data()
-            dynamic_config["attention"][name] = new_reminder
-            self._save_dynamic_config_data(dynamic_config)
-            logger.info(f"动态配置已保存，新增提醒: {name}")
-
-            # 启动新提醒任务
-            task = asyncio.create_task(self.reminder_loop(name, new_reminder))
-            self.reminder_tasks[name] = task
+            # 调度新提醒
+            self._schedule_reminder(name, new_reminder)
 
             yield event.plain_result(f"提醒 '{name}' 添加成功！")
 
@@ -274,31 +311,17 @@ class meeting_manager(Star):
                 yield event.plain_result(f"提醒 '{name}' 不存在")
                 return
 
-            # 停止任务
-            if name in self.reminder_tasks:
-                try:
-                    self.reminder_tasks[name].cancel()
-                    await self.reminder_tasks[name]
-                except asyncio.CancelledError:
-                    pass
-                except Exception as e:
-                    logger.error(f"停止提醒任务 {name} 失败: {e}")
+            # 取消定时器
+            if name in self.reminder_timers:
+                self.reminder_timers[name].cancel()
+                del self.reminder_timers[name]
 
-                del self.reminder_tasks[name]
+            # 清理调度器状态
+            if hasattr(self, "_times_sent") and name in self._times_sent:
+                del self._times_sent[name]
 
             # 从配置中删除
-            del self.config_data["attention"][name]
-
-            # 从下次提醒时间中删除
-            if name in self.next_reminder_times:
-                del self.next_reminder_times[name]
-
-            # 更新动态配置文件
-            dynamic_config = self._load_dynamic_config_data()
-            if name in dynamic_config["attention"]:
-                del dynamic_config["attention"][name]
-            self._save_dynamic_config_data(dynamic_config)
-            logger.info(f"动态配置已更新，删除提醒: {name}")
+            self._remove_reminder_from_config(name)
 
             yield event.plain_result(f"提醒 '{name}' 删除成功！")
 
@@ -316,16 +339,21 @@ class meeting_manager(Star):
 
             list_msg = "当前所有提醒任务:\n"
             for name, config in self.attention_config.items():
-                status = "运行中" if name in self.reminder_tasks else "已停止"
-                next_time = self.next_reminder_times.get(name, "未知")
+                status = "运行中" if name in self.reminder_timers else "已停止"
+                next_time = self._get_reminder_info(name).get("next_time", "未知")
                 if isinstance(next_time, datetime.datetime):
                     next_time = next_time.strftime("%Y-%m-%d %H:%M:%S")
+
+                # 计算已发送次数
+                times_sent = self._get_reminder_info(name).get("times_sent", 0)
 
                 list_msg += f"\n📅 {name} ({status})\n"
                 list_msg += f"   消息: {config.get('message', 'N/A')}\n"
                 list_msg += f"   下次提醒: {next_time}\n"
                 list_msg += f"   重复: {config.get('repeat', 'N/A')}\n"
-                list_msg += f"   剩余次数: {config.get('repeat_times', 'N/A')}\n"
+                list_msg += (
+                    f"   已发送: {times_sent}/{config.get('repeat_times', '∞')}\n"
+                )
 
             yield event.plain_result(list_msg)
 
@@ -391,8 +419,22 @@ class meeting_manager(Star):
         except Exception as e:
             logger.error(f"发送提醒失败: {e}")
 
-    async def reminder_loop(self, reminder_name: str, reminder_config: Dict[str, Any]):
-        """单个提醒的循环任务"""
+    async def start_all_reminders(self):
+        """启动所有提醒任务"""
+        for reminder_name, reminder_config in self.attention_config.items():
+            try:
+                self._schedule_reminder(reminder_name, reminder_config)
+                logger.info(f"已启动提醒: {reminder_name}")
+            except Exception as e:
+                logger.error(f"启动提醒 {reminder_name} 失败: {e}")
+
+    def _schedule_reminder(
+        self,
+        reminder_name: str,
+        reminder_config: Dict[str, Any],
+        next_time: datetime.datetime = None,
+    ):
+        """调度单个提醒"""
         try:
             base_time_str = reminder_config.get("time")
             repeat_str = reminder_config.get("repeat", "1:00:00:00")
@@ -403,97 +445,119 @@ class meeting_manager(Star):
             repeat_interval = self.parse_repeat_interval(repeat_str)
 
             now = datetime.datetime.now()
-            # 计算下次提醒时间
-            next_time = self.calculate_next_reminder_time(base_time, repeat_interval)
+
+            # 如果没有提供next_time，则计算下次提醒时间
+            if next_time is None:
+                next_time = self.calculate_next_reminder_time(
+                    base_time, repeat_interval
+                )
 
             # 判断是否已经超过最大提醒次数
             if repeat_times > 0 and repeat_interval.total_seconds() > 0:
-                # 计算最大允许的提醒时间点
                 max_time = base_time + repeat_interval * (repeat_times - 1)
                 if next_time > max_time:
                     logger.info(f"提醒 {reminder_name} 所有提醒已过期，不再发送")
                     return
-                # 计算已发送次数
-                times_sent = (
-                    next_time - base_time
-                ).total_seconds() // repeat_interval.total_seconds()
             elif repeat_times > 0 and repeat_interval.total_seconds() == 0:
-                # 只提醒一次
                 if now > base_time:
                     logger.info(f"提醒 {reminder_name} 已过期，不再发送")
                     return
-                times_sent = 0
-            else:
-                times_sent = 0
 
-            self.next_reminder_times[reminder_name] = next_time
+            # 计算延迟时间（秒）
+            delay = (next_time - now).total_seconds()
+            if delay <= 0:
+                delay = 1  # 如果时间已到，1秒后执行
+
+            # 使用asyncio定时器调度
+            loop = asyncio.get_event_loop()
+            timer = loop.call_later(
+                delay,
+                lambda: asyncio.create_task(
+                    self._execute_reminder(reminder_name, reminder_config)
+                ),
+            )
+
+            self.reminder_timers[reminder_name] = timer
+            self._set_reminder_info(reminder_name, next_time=next_time)
             logger.info(f"提醒 {reminder_name} 将在 {next_time} 发送")
 
-            while True:
-                now = datetime.datetime.now()
-                if now >= next_time:
-                    # 发送提醒
-                    await self.send_reminder(reminder_name, reminder_config)
-                    times_sent += 1
-
-                    # 检查是否达到重复次数限制
-                    if repeat_times > 0 and times_sent >= repeat_times:
-                        logger.info(
-                            f"提醒 {reminder_name} 已达到重复次数限制，停止发送"
-                        )
-                        break
-
-                    # 计算下次提醒时间
-                    next_time = next_time + repeat_interval
-                    self.next_reminder_times[reminder_name] = next_time
-                    logger.info(f"提醒 {reminder_name} 下次将在 {next_time} 发送")
-
-                # 等待一段时间再检查
-                await asyncio.sleep(60)  # 每分钟检查一次
-
-        except asyncio.CancelledError:
-            logger.info(f"提醒任务 {reminder_name} 已取消")
         except Exception as e:
-            logger.error(f"提醒任务 {reminder_name} 执行失败: {e}")
+            logger.error(f"调度提醒 {reminder_name} 失败: {e}")
 
-    async def start_all_reminders(self):
-        """启动所有提醒任务"""
-        for reminder_name, reminder_config in self.attention_config.items():
-            try:
-                task = asyncio.create_task(
-                    self.reminder_loop(reminder_name, reminder_config)
+    async def _execute_reminder(
+        self, reminder_name: str, reminder_config: Dict[str, Any]
+    ):
+        """执行单个提醒"""
+        try:
+            # 发送提醒
+            await self.send_reminder(reminder_name, reminder_config)
+
+            # 计算下次提醒时间
+            repeat_str = reminder_config.get("repeat", "1:00:00:00")
+            repeat_times = reminder_config.get("repeat_times", 0)
+            repeat_interval = self.parse_repeat_interval(repeat_str)
+
+            # 更新已发送次数
+            current_info = self._get_reminder_info(reminder_name)
+            times_sent = current_info.get("times_sent", 0) + 1
+            self._set_reminder_info(reminder_name, times_sent=times_sent)
+
+            # 检查是否达到重复次数限制
+            if repeat_times > 0 and times_sent >= repeat_times:
+                logger.info(f"提醒 {reminder_name} 已达到重复次数限制，停止发送")
+                if reminder_name in self.reminder_timers:
+                    self.reminder_timers[reminder_name].cancel()
+                    del self.reminder_timers[reminder_name]
+                self._remove_reminder_info(reminder_name)
+                return
+
+            # 计算下次提醒时间
+            current_time = current_info.get("next_time")
+            if current_time:
+                next_time = current_time + repeat_interval
+            else:
+                # 如果获取不到当前时间，重新计算
+                base_time_str = reminder_config.get("time")
+                base_time = datetime.datetime.strptime(
+                    base_time_str, "%Y-%m-%d %H:%M:%S"
                 )
-                self.reminder_tasks[reminder_name] = task
-                logger.info(f"已启动提醒任务: {reminder_name}")
-            except Exception as e:
-                logger.error(f"启动提醒任务 {reminder_name} 失败: {e}")
+                next_time = self.calculate_next_reminder_time(
+                    base_time, repeat_interval
+                )
+
+            # 更新提醒信息并重新调度
+            self._schedule_reminder(reminder_name, reminder_config, next_time)
+            logger.info(f"提醒 {reminder_name} 下次将在 {next_time} 发送")
+
+        except Exception as e:
+            logger.error(f"执行提醒 {reminder_name} 失败: {e}")
 
     async def stop_all_reminders(self):
         """停止所有提醒任务"""
-        for task_name, task in self.reminder_tasks.items():
+        # 取消所有定时器
+        for reminder_name, timer in self.reminder_timers.items():
             try:
-                task.cancel()
-                await task
-                logger.info(f"已停止提醒任务: {task_name}")
-            except asyncio.CancelledError:
-                pass
+                timer.cancel()
+                logger.info(f"已停止提醒: {reminder_name}")
             except Exception as e:
-                logger.error(f"停止提醒任务 {task_name} 失败: {e}")
+                logger.error(f"停止提醒 {reminder_name} 失败: {e}")
 
-        self.reminder_tasks.clear()
-        self.next_reminder_times.clear()
+        self.reminder_timers.clear()
+        self.reminder_info.clear()
 
     @filter.command("reminder_status")
     async def reminder_status(self, event: AstrMessageEvent):
         """查看提醒状态"""
         try:
-            if not self.next_reminder_times:
+            if not self.reminder_info:
                 yield event.plain_result("当前没有活跃的提醒任务")
                 return
 
             status_msg = "当前提醒状态:\n"
-            for reminder_name, next_time in self.next_reminder_times.items():
-                status_msg += f"- {reminder_name}: 下次提醒时间 {next_time.strftime('%Y-%m-%d %H:%M:%S')}\n"
+            for reminder_name, info in self.reminder_info.items():
+                next_time = info.get("next_time")
+                if next_time:
+                    status_msg += f"- {reminder_name}: 下次提醒时间 {next_time.strftime('%Y-%m-%d %H:%M:%S')}\n"
 
             yield event.plain_result(status_msg)
 
